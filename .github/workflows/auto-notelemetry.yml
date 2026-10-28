@@ -1,0 +1,117 @@
+name: auto-notelemetry
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 查找官方最新包
+        id: up
+        run: |
+          tag=""
+          for repo in Fanju6/NetProxy-Releases Fanju6/NetProxy-Magisk; do
+            t=$(gh release list --repo "$repo" --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+            [ -n "$t" ] || continue
+            if gh release download "$t" --repo "$repo" --pattern 'NetProxy_*.zip' --dir official 2>/dev/null; then
+              tag="$t"; break
+            fi
+          done
+          [ -n "$tag" ] || { echo "没找到官方 zip"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "nt-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "已经处理过 $tag"
+          fi
+
+      - name: 从官方包里读出源码提交号
+        if: steps.up.outputs.skip != 'true'
+        id: commit
+        run: |
+          cat > pkg.py <<'PY'
+          import zipfile, struct, lzma
+          def read_entry(path, name):
+              z = zipfile.ZipFile(path); fh = open(path, 'rb')
+              i = z.getinfo(name)
+              if i.compress_type in (0, 8): return z.read(i)
+              if i.compress_type == 95:
+                  fh.seek(i.header_offset); h = fh.read(30)
+                  n, e = struct.unpack('<HH', h[26:30])
+                  fh.seek(i.header_offset + 30 + n + e)
+                  return lzma.decompress(fh.read(i.compress_size))
+              raise SystemExit('不支持的压缩方式 %d' % i.compress_type)
+          PY
+          python3 - <<'PY'
+          import re, glob, io, zipfile
+          from pkg import read_entry
+          official = glob.glob('official/NetProxy_*.zip')[0]
+          apk = zipfile.ZipFile(io.BytesIO(read_entry(official, 'NetProxy.apk')))
+          manifest = apk.read('AndroidManifest.xml')
+          m = re.search(rb'ci\.([0-9a-f]{7,40})', manifest) or re.search(rb'c\x00i\x00\.\x00((?:[0-9a-f]\x00){7,40})', manifest)
+          if not m: raise SystemExit('官方 APK 的 versionName 里没有提交号')
+          sha = m.group(1).replace(b'\x00', b'').decode()
+          open('commit.txt', 'w').write(sha)
+          print('源码提交:', sha)
+          PY
+          echo "sha=$(cat commit.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: 下载对应源码
+        if: steps.up.outputs.skip != 'true'
+        run: |
+          mkdir upstream
+          curl -fL --retry 5 -o src.tgz "https://codeload.github.com/Fanju6/NetProxy-Magisk/tar.gz/${{ steps.commit.outputs.sha }}"
+          tar -xzf src.tgz -C upstream --strip-components=1
+
+      - uses: actions/setup-go@v5
+        if: steps.up.outputs.skip != 'true'
+        with:
+          go-version-file: upstream/src/native/netproxy/go.mod
+
+      - name: 编译（不注入统计凭据）
+        if: steps.up.outputs.skip != 'true'
+        working-directory: upstream/src/native/netproxy
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          if grep -rnIE "phc_[A-Za-z0-9]{20,}" ../../.. | grep -v _test.go; then
+            echo "源码里有写死的 key，需要改用方案 B"; exit 1
+          fi
+          go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl \
+            || GOEXPERIMENT=jsonv2 go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl
+          if grep -a -q -i -E "posthog|phc_[A-Za-z0-9]{20,}" "$RUNNER_TEMP/netproxyctl"; then
+            echo "产物里仍有统计地址或 key"; exit 1
+          fi
+
+      - name: 替换并发布
+        if: steps.up.outputs.skip != 'true'
+        run: |
+          OUT="NetProxy_notelemetry_${{ steps.up.outputs.tag }}.zip"
+          python3 - "$(ls official/NetProxy_*.zip | head -1)" "$RUNNER_TEMP/netproxyctl" "$OUT" <<'PY'
+          import sys, zipfile
+          from pkg import read_entry
+          src, newbin, dst = sys.argv[1:4]
+          zin = zipfile.ZipFile(src); found = False
+          with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zout:
+              for i in zin.infolist():
+                  if i.is_dir(): continue
+                  n = i.filename
+                  data = open(newbin, 'rb').read() if n == 'bin/netproxyctl' else read_entry(src, n)
+                  found |= (n == 'bin/netproxyctl')
+                  zi = zipfile.ZipInfo(n, i.date_time); zi.compress_type = zipfile.ZIP_DEFLATED
+                  exe = n.startswith('bin/') or n.endswith('.sh') or n in ('netproxyctl', 'META-INF/com/google/android/update-binary')
+                  zi.external_attr = (0o755 if exe else 0o644) << 16
+                  zout.writestr(zi, data)
+          if not found: raise SystemExit('官方 zip 里没有 bin/netproxyctl')
+          PY
+          sha256sum "$OUT"
+          gh release create "nt-${{ steps.up.outputs.tag }}" "$OUT" --repo "$GITHUB_REPOSITORY" \
+            --title "NetProxy ${{ steps.up.outputs.tag }}（去统计）" \
+            --notes "基于官方 ${{ steps.up.outputs.tag }}，源码提交 ${{ steps.commit.outputs.sha }}，仅替换 bin/netproxyctl，编译时未注入统计凭据。"
