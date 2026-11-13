@@ -79,20 +79,24 @@ jobs:
       - name: 判断是否已处理
         id: chk
         run: |
+          sha="${{ steps.commit.outputs.sha }}"
           if [ "${{ matrix.channel }}" = nightly ]; then
-            sha="${{ steps.commit.outputs.sha }}"
             name="nightly-${sha:0:7}"
           else
             name="${{ steps.up.outputs.tag }}"
           fi
+          # release 的 tag 跟官方一致：正式版是 v8.7.0，每夜版固定是 nightly
+          rel="${{ steps.up.outputs.tag }}"
           echo "name=$name" >> "$GITHUB_OUTPUT"
-          if gh release view "nt-$name" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [ "${{ inputs.force }}" = true ]; then
-              gh release delete "nt-$name" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-              echo "强制重建 $name"
-            else
+          echo "rel=$rel" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" = true ]; then
+            echo "强制重建 $rel"
+          elif gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 正式版：tag 已存在就算处理过；每夜版：还要看已发布的是不是同一个源码提交
+            if [ "${{ matrix.channel }}" != nightly ] \
+              || gh release view "$rel" --repo "$GITHUB_REPOSITORY" --json body -q .body | grep -q "$sha"; then
               echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "已经处理过 $name"
+              echo "已经处理过 $rel"
             fi
           fi
 
@@ -129,48 +133,31 @@ jobs:
         if: steps.chk.outputs.skip != 'true'
         run: |
           NAME="${{ steps.chk.outputs.name }}"
+          REL="${{ steps.chk.outputs.rel }}"
           OUT="NetProxy_notelemetry_${NAME}.zip"
           python3 - "$(ls official/NetProxy_*.zip | head -1)" "$RUNNER_TEMP/netproxyctl" "$OUT" <<'PY'
-          import sys, re, zipfile
+          import sys, zipfile
           from pkg import read_entry
           src, newbin, dst = sys.argv[1:4]
-          SUFFIX = '_notelemetry'
-
-          def rename_module(data):
-              text = data.decode('utf-8')
-              def repl(m):
-                  old = m.group(2)
-                  new = old if old.endswith(SUFFIX) else old + SUFFIX
-                  return m.group(1) + new + m.group(3)
-              text, c = re.subn(r'(?m)^(name=)(.*?)(\r?)$', repl, text, count=1)
-              if not c: raise SystemExit('module.prop 里没有 name=')
-              print('module.prop:', re.search(r'(?m)^name=.*$', text).group(0))
-              return text.encode('utf-8')
-
-          zin = zipfile.ZipFile(src); found = False; renamed = False
+          zin = zipfile.ZipFile(src); found = False
           with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zout:
               for i in zin.infolist():
                   if i.is_dir(): continue
                   n = i.filename
-                  if n == 'bin/netproxyctl':
-                      data = open(newbin, 'rb').read(); found = True
-                  elif n == 'module.prop':
-                      data = rename_module(read_entry(src, n)); renamed = True
-                  else:
-                      data = read_entry(src, n)
+                  data = open(newbin, 'rb').read() if n == 'bin/netproxyctl' else read_entry(src, n)
+                  found |= (n == 'bin/netproxyctl')
                   zi = zipfile.ZipInfo(n, i.date_time); zi.compress_type = zipfile.ZIP_DEFLATED
                   exe = n.startswith('bin/') or n.endswith('.sh') or n in ('netproxyctl', 'META-INF/com/google/android/update-binary')
                   zi.external_attr = (0o755 if exe else 0o644) << 16
                   zout.writestr(zi, data)
           if not found: raise SystemExit('官方 zip 里没有 bin/netproxyctl')
-          if not renamed: raise SystemExit('官方 zip 里没有 module.prop')
           PY
           sha256sum "$OUT"
 
           # 发布说明：去统计说明 + 官方更新日志
           {
             echo "基于官方 ${{ steps.up.outputs.tag }}，源码提交 ${{ steps.commit.outputs.sha }}。"
-            echo "仅替换 bin/netproxyctl，模块名称加后缀 _notelemetry，编译时未注入统计凭据。"
+            echo "仅替换 bin/netproxyctl，编译时未注入统计凭据。"
             echo
             echo "---"
             echo
@@ -179,17 +166,11 @@ jobs:
             if [ -s official_notes.md ]; then cat official_notes.md; else echo "（官方未提供更新日志）"; fi
           } > notes.md
 
+          # 同名 release 已存在（每夜版有新提交 / 强制重建）：先删掉再建，tag 一并重建
+          gh release delete "$REL" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+
           EXTRA=""
           [ "${{ matrix.channel }}" = nightly ] && EXTRA="--prerelease"
-          gh release create "nt-${NAME}" "$OUT" --repo "$GITHUB_REPOSITORY" $EXTRA \
+          gh release create "$REL" "$OUT" --repo "$GITHUB_REPOSITORY" $EXTRA \
             --title "NetProxy ${NAME}（去统计）" \
             --notes-file notes.md
-
-      - name: 清理旧的 nightly（保留最近 3 个）
-        if: matrix.channel == 'nightly'
-        run: |
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            -q 'map(select(.tagName|startswith("nt-nightly-")))|sort_by(.createdAt)|reverse|.[3:]|.[].tagName' \
-            | while read -r t; do
-                [ -n "$t" ] && gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-              done
