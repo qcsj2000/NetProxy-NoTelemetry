@@ -11,28 +11,47 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable: 官方正式版；prerelease: 官方其他测试版（beta/rc 等）；nightly: 每夜版
+        channel: [stable, prerelease, nightly]
     steps:
       - name: 查找官方最新包
         id: up
         run: |
           tag=""
           for repo in Fanju6/NetProxy-Releases Fanju6/NetProxy-Magisk; do
-            t=$(gh release list --repo "$repo" --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+            case "${{ matrix.channel }}" in
+              nightly)
+                t=nightly
+                ;;
+              prerelease)
+                t=$(gh release list --repo "$repo" --limit 30 --json tagName,isPrerelease \
+                  -q '[.[] | select(.isPrerelease and .tagName != "nightly")][0].tagName // empty' 2>/dev/null || true)
+                ;;
+              *)
+                t=$(gh release list --repo "$repo" --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+                ;;
+            esac
             [ -n "$t" ] || continue
             if gh release download "$t" --repo "$repo" --pattern 'NetProxy_*.zip' --dir official 2>/dev/null; then
               tag="$t"; break
             fi
           done
-          [ -n "$tag" ] || { echo "没找到官方 zip"; exit 1; }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if gh release view "nt-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "已经处理过 $tag"
+          if [ -z "$tag" ]; then
+            if [ "${{ matrix.channel }}" = prerelease ]; then
+              echo "官方当前没有其他测试版，跳过"
+              echo "none=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "没找到官方 zip"; exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: 从官方包里读出源码提交号
-        if: steps.up.outputs.skip != 'true'
         id: commit
+        if: steps.up.outputs.none != 'true'
         run: |
           cat > pkg.py <<'PY'
           import zipfile, struct, lzma
@@ -61,20 +80,39 @@ jobs:
           PY
           echo "sha=$(cat commit.txt)" >> "$GITHUB_OUTPUT"
 
+      - name: 判断是否已处理
+        id: chk
+        run: |
+          if [ "${{ steps.up.outputs.none }}" = true ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ matrix.channel }}" = nightly ]; then
+            sha="${{ steps.commit.outputs.sha }}"
+            name="nightly-${sha:0:7}"
+          else
+            name="${{ steps.up.outputs.tag }}"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          if gh release view "nt-$name" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "已经处理过 $name"
+          fi
+
       - name: 下载对应源码
-        if: steps.up.outputs.skip != 'true'
+        if: steps.chk.outputs.skip != 'true'
         run: |
           mkdir upstream
           curl -fL --retry 5 -o src.tgz "https://codeload.github.com/Fanju6/NetProxy-Magisk/tar.gz/${{ steps.commit.outputs.sha }}"
           tar -xzf src.tgz -C upstream --strip-components=1
 
       - uses: actions/setup-go@v5
-        if: steps.up.outputs.skip != 'true'
+        if: steps.chk.outputs.skip != 'true'
         with:
           go-version-file: upstream/src/native/netproxy/go.mod
 
       - name: 编译（不注入统计凭据）
-        if: steps.up.outputs.skip != 'true'
+        if: steps.chk.outputs.skip != 'true'
         working-directory: upstream/src/native/netproxy
         env:
           GOOS: android
@@ -91,9 +129,10 @@ jobs:
           fi
 
       - name: 替换并发布
-        if: steps.up.outputs.skip != 'true'
+        if: steps.chk.outputs.skip != 'true'
         run: |
-          OUT="NetProxy_notelemetry_${{ steps.up.outputs.tag }}.zip"
+          NAME="${{ steps.chk.outputs.name }}"
+          OUT="NetProxy_notelemetry_${NAME}.zip"
           python3 - "$(ls official/NetProxy_*.zip | head -1)" "$RUNNER_TEMP/netproxyctl" "$OUT" <<'PY'
           import sys, zipfile
           from pkg import read_entry
@@ -112,6 +151,17 @@ jobs:
           if not found: raise SystemExit('官方 zip 里没有 bin/netproxyctl')
           PY
           sha256sum "$OUT"
-          gh release create "nt-${{ steps.up.outputs.tag }}" "$OUT" --repo "$GITHUB_REPOSITORY" \
-            --title "NetProxy ${{ steps.up.outputs.tag }}（去统计）" \
+          EXTRA=""
+          [ "${{ matrix.channel }}" != stable ] && EXTRA="--prerelease"
+          gh release create "nt-${NAME}" "$OUT" --repo "$GITHUB_REPOSITORY" $EXTRA \
+            --title "NetProxy ${NAME}（去统计）" \
             --notes "基于官方 ${{ steps.up.outputs.tag }}，源码提交 ${{ steps.commit.outputs.sha }}，仅替换 bin/netproxyctl，编译时未注入统计凭据。"
+
+      - name: 清理旧的 nightly（保留最近 3 个）
+        if: matrix.channel == 'nightly'
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            -q 'map(select(.tagName|startswith("nt-nightly-")))|sort_by(.createdAt)|reverse|.[3:]|.[].tagName' \
+            | while read -r t; do
+                [ -n "$t" ] && gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done
