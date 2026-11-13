@@ -38,6 +38,7 @@ jobs:
               # 优先取 NetProxy-Magisk 的说明（更新日志写在那边），取不到再用下载包的仓库
               for r in Fanju6/NetProxy-Magisk "$repo"; do
                 gh release view "$t" --repo "$r" --json body -q .body > official_notes.md 2>/dev/null || true
+                gh release view "$t" --repo "$r" --json name -q .name > official_title.txt 2>/dev/null || true
                 [ -s official_notes.md ] && break
               done
               break
@@ -134,8 +135,16 @@ jobs:
         run: |
           NAME="${{ steps.chk.outputs.name }}"
           REL="${{ steps.chk.outputs.rel }}"
-          OUT="NetProxy_notelemetry_${NAME}.zip"
-          python3 - "$(ls official/NetProxy_*.zip | head -1)" "$RUNNER_TEMP/netproxyctl" "$OUT" <<'PY'
+          OFFICIAL="$(ls official/NetProxy_*.zip | head -1)"
+          BASE="$(basename "$OFFICIAL")"
+          # 文件名沿用官方的：正式版同名，每夜版在 NetProxy_ 后面加 nightly_
+          # 例：NetProxy_v8.7.0_1101.zip -> NetProxy_nightly_v8.7.0_1101.zip
+          if [ "${{ matrix.channel }}" = nightly ]; then
+            OUT="NetProxy_nightly_${BASE#NetProxy_}"
+          else
+            OUT="$BASE"
+          fi
+          python3 - "$OFFICIAL" "$RUNNER_TEMP/netproxyctl" "$OUT" <<'PY'
           import sys, zipfile
           from pkg import read_entry
           src, newbin, dst = sys.argv[1:4]
@@ -169,8 +178,12 @@ jobs:
           # 同名 release 已存在（每夜版有新提交 / 强制重建）：先删掉再建，tag 一并重建
           gh release delete "$REL" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
 
+          # 标题沿用官方 release 的标题，后面加（去统计）；官方没写标题就用 tag
+          TITLE="$(cat official_title.txt 2>/dev/null || true)"
+          [ -n "$TITLE" ] || TITLE="${{ steps.up.outputs.tag }}"
+
           EXTRA=""
           [ "${{ matrix.channel }}" = nightly ] && EXTRA="--prerelease"
           gh release create "$REL" "$OUT" --repo "$GITHUB_REPOSITORY" $EXTRA \
-            --title "NetProxy ${NAME}（去统计）" \
+            --title "${TITLE}（去统计）" \
             --notes-file notes.md
