@@ -18,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # 一个接一个跑：先正式版，后每夜版。GitHub 大致按创建先后排列，后建的在前，
+      # 这样每夜版会排在正式版上面，和官方一致
+      max-parallel: 1
       matrix:
         channel: [stable, nightly]
     steps:
@@ -137,13 +140,10 @@ jobs:
           REL="${{ steps.chk.outputs.rel }}"
           OFFICIAL="$(ls official/NetProxy_*.zip | head -1)"
           BASE="$(basename "$OFFICIAL")"
-          # 文件名沿用官方的：正式版同名，每夜版在 NetProxy_ 后面加 nightly_
-          # 例：NetProxy_v8.7.0_1101.zip -> NetProxy_nightly_v8.7.0_1101.zip
-          if [ "${{ matrix.channel }}" = nightly ]; then
-            OUT="NetProxy_nightly_${BASE#NetProxy_}"
-          else
-            OUT="$BASE"
-          fi
+          # 文件名沿用官方的，在 NetProxy_ 后面加 notelemetry_（正式版和每夜版一样）
+          # NetProxy_v8.7.0_1100.zip -> NetProxy_notelemetry_v8.7.0_1100.zip
+          # NetProxy_v8.7.0_1101.zip -> NetProxy_notelemetry_v8.7.0_1101.zip
+          OUT="NetProxy_notelemetry_${BASE#NetProxy_}"
           python3 - "$OFFICIAL" "$RUNNER_TEMP/netproxyctl" "$OUT" <<'PY'
           import sys, zipfile
           from pkg import read_entry
