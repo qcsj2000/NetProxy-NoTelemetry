@@ -116,6 +116,36 @@ jobs:
         with:
           go-version-file: upstream/src/native/netproxy/go.mod
 
+      - name: 删除统计代码（替换为空实现）
+        if: steps.chk.outputs.skip != 'true'
+        working-directory: upstream/src/native/netproxy
+        run: |
+          f=internal/telemetry/telemetry.go
+          [ -f "$f" ] || { echo "找不到 $f，官方可能改了统计代码的位置，需要重新适配"; exit 1; }
+          cat > "$f" <<'GO'
+          // Package telemetry 是去统计版的空实现：不收集设备信息，不写状态文件，不发起任何网络请求。
+          package telemetry
+
+          import (
+          	"context"
+          	"time"
+
+          	"github.com/Fanju6/NetProxy-Magisk/src/native/netproxy/internal/paths"
+          )
+
+          // Reporter 只是占位类型，所有方法都是空操作。
+          type Reporter struct{}
+
+          // New 永远返回 nil，调用方对 nil 上报器已做空操作处理。
+          func New(paths.Layout) *Reporter { return nil }
+
+          func (r *Reporter) RecordActive(time.Time) (bool, error)                     { return false, nil }
+          func (r *Reporter) RecordStart(time.Time, time.Duration, string, bool) error { return nil }
+          func (r *Reporter) Notify()                                                  {}
+          func (r *Reporter) Run(context.Context, func() bool, func())                 {}
+          GO
+          rm -f internal/telemetry/*_test.go
+
       - name: 编译（不注入统计凭据）
         if: steps.chk.outputs.skip != 'true'
         working-directory: upstream/src/native/netproxy
@@ -131,6 +161,9 @@ jobs:
             || GOEXPERIMENT=jsonv2 go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl
           if grep -a -q -i -E "posthog|phc_[A-Za-z0-9]{20,}" "$RUNNER_TEMP/netproxyctl"; then
             echo "产物里仍有统计地址或 key"; exit 1
+          fi
+          if grep -a -q -E "telemetry\.(readDeviceID|hashDeviceID|readCompatibility|newUploadClient)" "$RUNNER_TEMP/netproxyctl"; then
+            echo "产物里仍有设备信息收集或上传代码"; exit 1
           fi
 
       - name: 替换并发布
