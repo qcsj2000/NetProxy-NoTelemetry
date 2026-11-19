@@ -116,13 +116,177 @@ jobs:
         with:
           go-version-file: upstream/src/native/netproxy/go.mod
 
-      - name: 删除统计代码（替换为空实现）
+      - name: 删除统计代码
+        id: strip
         if: steps.chk.outputs.skip != 'true'
         working-directory: upstream/src/native/netproxy
         run: |
-          f=internal/telemetry/telemetry.go
-          [ -f "$f" ] || { echo "找不到 $f，官方可能改了统计代码的位置，需要重新适配"; exit 1; }
-          cat > "$f" <<'GO'
+          cat > "$RUNNER_TEMP/strip_telemetry.py" <<'PY'
+          #!/usr/bin/env python3
+          """删除 NetProxy 源码里的统计代码：telemetry 包及所有调用点。任何一处对不上就报错退出（由调用方回退到空实现）。"""
+          import os, re, shutil, sys
+
+          root = sys.argv[1]  # .../src/native/netproxy
+          def P(*a): return os.path.join(root, *a)
+
+          def edit(path, subs):
+              s = open(path, encoding='utf-8').read()
+              for old, new in subs:
+                  if s.count(old) != 1:
+                      sys.exit(f"对不上: {path}: {old[:60]!r} (出现 {s.count(old)} 次)")
+                  s = s.replace(old, new, 1)
+              open(path, 'w', encoding='utf-8').write(s)
+
+          # 1. 删掉 telemetry 包
+          shutil.rmtree(P('internal', 'telemetry'))
+
+          # 2. app.go
+          edit(P('internal', 'module', 'app.go'), [
+              ('\t"github.com/Fanju6/NetProxy-Magisk/src/native/netproxy/internal/telemetry"\n', ''),
+              ('\tTelemetry          *telemetry.Reporter\n', ''),
+              ('\t\tTelemetry:      telemetry.New(layout),\n', ''),
+              ('''	if options.Telemetry != nil {
+          		workerOptions.Telemetry = options.Telemetry
+          		workerOptions.CoreRunning = func() bool {
+          			state, err := ReadServiceState(options.StateFile)
+          			return err == nil && state.State == "ready" && state.PID > 0 && service.FindProcess(options.SingBoxPath, int(state.PID)) == int(state.PID)
+          		}
+          	}
+          ''', ''),
+              ('''// RecordActivity 仅记录公共客户端的活跃；停服入口不能为统计重新启动 Worker。
+          func RecordActivity(ctx context.Context, options Options, startWorker bool) {
+          	if options.Telemetry == nil || ctx.Err() != nil {
+          		return
+          	}
+          	if added, err := options.Telemetry.RecordActive(time.Now()); added && err == nil {
+          		options.Telemetry.Notify()
+          		if startWorker {
+          			_ = EnsureWorker(ctx, options)
+          		}
+          	}
+          }
+
+          ''', ''),
+          ])
+
+          # 3. lifecycle.go
+          edit(P('internal', 'module', 'lifecycle.go'), [
+              ('''	attemptedAt := time.Now()
+          	stage := "launch"
+          	defer func() {
+          		if ctx.Err() == nil {
+          			_ = options.Telemetry.RecordStart(time.Now(), time.Since(attemptedAt), stage, err == nil)
+          		}
+          	}()
+          ''', ''),
+          ])
+          # stage 变量只用于上报：删掉所有 stage = "..." 赋值
+          lp = P('internal', 'module', 'lifecycle.go')
+          s = open(lp, encoding='utf-8').read()
+          s, n = re.subn(r'(?m)^\tstage = "(?:cgroup|state|ready|mode)"\n', '', s)
+          if n != 5: sys.exit(f"对不上: lifecycle.go stage 赋值应有 5 处，实际 {n}")
+          if re.search(r'\bstage\b', s.split('func startPreparedService')[1].split('\n}\n')[0]):
+              sys.exit("对不上: lifecycle.go 里 stage 还有别的用途")
+          open(lp, 'w', encoding='utf-8').write(s)
+
+          # 4. internal_worker.go
+          edit(P('cmd', 'netproxyctl', 'internal_worker.go'), [
+              ('\t"github.com/Fanju6/NetProxy-Magisk/src/native/netproxy/internal/service"\n', ''),
+          ])
+          ip = P('cmd', 'netproxyctl', 'internal_worker.go')
+          s = open(ip, encoding='utf-8').read()
+          m = re.search(r'\tif moduleOptions\.Telemetry != nil \{\n.*?\n\t\}\n', s, re.S)
+          if not m or 'FindProcess' not in m.group(0) or m.group(0).count('\n\t}\n') != 1 and False: sys.exit("对不上: internal_worker.go Telemetry 块")
+          s = s.replace(m.group(0), '', 1)
+          open(ip, 'w', encoding='utf-8').write(s)
+
+          # 5. main.go：不再记录活跃
+          edit(P('cmd', 'netproxyctl', 'main.go'), [
+              ('''	if status != 2 && !skipActivity(args) {
+          		stop := len(args) > 1 && args[0] == "service" && (args[1] == "stop" || args[1] == "toggle")
+          		moduleapp.RecordActivity(commandCtx, c.options, !stop)
+          	}
+          ''', ''),
+          ])
+
+          # 6. httpapi/server.go
+          edit(P('internal', 'httpapi', 'server.go'), [
+              ('''		if pattern != "GET /api/v1/info" && pattern != "POST /api/v1/auth/provision" && !strings.Contains(pattern, "/android/") {
+          			moduleapp.RecordActivity(ctx, s.options, false)
+          		}
+          ''', ''),
+          ])
+
+          # 7. worker.go / process.go
+          edit(P('internal', 'worker', 'worker.go'), [
+              ('''	Telemetry               interface {
+          		Run(context.Context, func() bool, func())
+          		Notify()
+          	}
+          ''', ''),
+              ('''	var telemetryDone chan struct{}
+          	if options.Telemetry != nil {
+          		telemetryDone = make(chan struct{})
+          		go func() {
+          			defer close(telemetryDone)
+          			options.Telemetry.Run(background, options.CoreRunning, func() {
+          				logWorker(logger, "WARN", "telemetry.upload", "waiting", "设备统计暂未完成，将稍后重试")
+          			})
+          		}()
+          	}
+          ''', ''),
+              ('''		if telemetryDone != nil {
+          			<-telemetryDone
+          		}
+          ''', ''),
+              ('!networkWatchEnabled && options.Telemetry == nil && options.APIConfig', '!networkWatchEnabled && options.APIConfig'),
+              ('''				if options.Telemetry != nil {
+          					options.Telemetry.Notify()
+          				}
+          ''', ''),
+          ])
+          edit(P('internal', 'worker', 'process.go'), [
+              ('err != nil && options.Telemetry == nil && options.APIConfig', 'err != nil && options.APIConfig'),
+              ('options.NetworkEvaluate != nil) && options.Telemetry == nil && options.APIConfig', 'options.NetworkEvaluate != nil) && options.APIConfig'),
+          ])
+          edit(P('internal', 'paths', 'paths.go'), [
+              ('''// TelemetryState 返回不参与配置编辑与日志导出的设备统计状态。
+          func (l Layout) TelemetryState() string { return filepath.Join(l.Config(), "telemetry", "state.json") }
+
+          // TelemetryLock 返回目录热切换期间仍保持同一 inode 的统计锁。
+          func (l Layout) TelemetryLock() string { return filepath.Join(l.DevRoot(), "telemetry.lock.flock") }
+
+          ''', ''),
+          ])
+          print("统计代码已删除")
+          PY
+          # 先留一份原始源码，整体删除编译不过时可以退回
+          cp -r . "$RUNNER_TEMP/netproxy.orig"
+          if python3 -I "$RUNNER_TEMP/strip_telemetry.py" .; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::整体删除统计代码没对上官方源码，改用空实现"
+            rm -rf ./* && cp -r "$RUNNER_TEMP/netproxy.orig/." .
+            echo "mode=stub" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 编译（不注入统计凭据）
+        if: steps.chk.outputs.skip != 'true'
+        working-directory: upstream/src/native/netproxy
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          build() {
+            go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl \
+              || GOEXPERIMENT=jsonv2 go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl
+          }
+          use_stub() {
+            rm -rf ./* && cp -r "$RUNNER_TEMP/netproxy.orig/." .
+            f=internal/telemetry/telemetry.go
+            [ -f "$f" ] || { echo "找不到 $f，官方可能改了统计代码的位置，需要重新适配"; exit 1; }
+            cat > "$f" <<'GO'
           // Package telemetry 是去统计版的空实现：不收集设备信息，不写状态文件，不发起任何网络请求。
           package telemetry
 
@@ -144,26 +308,29 @@ jobs:
           func (r *Reporter) Notify()                                                  {}
           func (r *Reporter) Run(context.Context, func() bool, func())                 {}
           GO
-          rm -f internal/telemetry/*_test.go
-
-      - name: 编译（不注入统计凭据）
-        if: steps.chk.outputs.skip != 'true'
-        working-directory: upstream/src/native/netproxy
-        env:
-          GOOS: android
-          GOARCH: arm64
-          CGO_ENABLED: "0"
-        run: |
+            rm -f internal/telemetry/*_test.go
+            build
+          }
+          mode="${{ steps.strip.outputs.mode }}"
           if grep -rnIE "phc_[A-Za-z0-9]{20,}" ../../.. | grep -v _test.go; then
             echo "源码里有写死的 key，需要改用方案 B"; exit 1
           fi
-          go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl \
-            || GOEXPERIMENT=jsonv2 go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/netproxyctl" ./cmd/netproxyctl
-          if grep -a -q -i -E "posthog|phc_[A-Za-z0-9]{20,}" "$RUNNER_TEMP/netproxyctl"; then
+          if [ "$mode" = full ] && ! build; then
+            echo "::warning::整体删除后编译失败，改用空实现"
+            mode=stub; use_stub
+          elif [ "$mode" = stub ]; then
+            use_stub
+          fi
+          echo "统计代码处理方式: $mode"
+          BIN="$RUNNER_TEMP/netproxyctl"
+          if grep -a -q -i -E "posthog|phc_[A-Za-z0-9]{20,}" "$BIN"; then
             echo "产物里仍有统计地址或 key"; exit 1
           fi
-          if grep -a -q -E "telemetry\.(readDeviceID|hashDeviceID|readCompatibility|newUploadClient)" "$RUNNER_TEMP/netproxyctl"; then
+          if grep -a -q -E "telemetry\.(readDeviceID|hashDeviceID|readCompatibility|newUploadClient)" "$BIN"; then
             echo "产物里仍有设备信息收集或上传代码"; exit 1
+          fi
+          if [ "$mode" = full ] && grep -a -q -E "internal/telemetry|telemetry\.upload|telemetry\.lock" "$BIN"; then
+            echo "产物里仍有统计相关残留"; exit 1
           fi
 
       - name: 替换并发布
@@ -181,13 +348,28 @@ jobs:
           import sys, zipfile
           from pkg import read_entry
           src, newbin, dst = sys.argv[1:4]
+
+          def strip_lock(data):
+              # 去掉安装脚本里为统计创建的锁文件（统计代码已删除，没有人再用它）
+              lines = data.decode('utf-8').split('\n')
+              drop = ('exec 3>/dev/netproxy/telemetry.lock.flock', 'flock -n 3 3>&3 || exit 1')
+              kept = [l for l in lines if l.strip() not in drop]
+              if len(lines) - len(kept) != 2:
+                  print('::warning::customize.sh 里没找到统计锁的两行，保持原样')
+                  return data
+              return '\n'.join(kept).encode('utf-8')
+
           zin = zipfile.ZipFile(src); found = False
           with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zout:
               for i in zin.infolist():
                   if i.is_dir(): continue
                   n = i.filename
-                  data = open(newbin, 'rb').read() if n == 'bin/netproxyctl' else read_entry(src, n)
-                  found |= (n == 'bin/netproxyctl')
+                  if n == 'bin/netproxyctl':
+                      data = open(newbin, 'rb').read(); found = True
+                  elif n == 'customize.sh':
+                      data = strip_lock(read_entry(src, n))
+                  else:
+                      data = read_entry(src, n)
                   zi = zipfile.ZipInfo(n, i.date_time); zi.compress_type = zipfile.ZIP_DEFLATED
                   exe = n.startswith('bin/') or n.endswith('.sh') or n in ('netproxyctl', 'META-INF/com/google/android/update-binary')
                   zi.external_attr = (0o755 if exe else 0o644) << 16
