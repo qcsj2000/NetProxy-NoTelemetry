@@ -8,6 +8,10 @@ on:
         description: 重新构建已处理过的版本（会先删除同名 release）
         type: boolean
         default: false
+      tag:
+        description: 指定要构建的原仓库版本号，例如 v8.6.2（留空=自动构建最新正式版和每夜版）
+        type: string
+        default: ""
 permissions:
   contents: write
 env:
@@ -22,32 +26,36 @@ jobs:
       # 这样每夜版会排在正式版上面，和官方一致
       max-parallel: 1
       matrix:
-        channel: [stable, nightly]
+        # 指定了版本号就只构建这一个版本；留空时构建最新正式版和每夜版
+        channel: ${{ fromJSON(inputs.tag && '["stable"]' || '["stable","nightly"]') }}
     steps:
       - name: 查找官方最新包
         id: up
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          tag=""
-          for repo in Fanju6/NetProxy-Releases Fanju6/NetProxy-Magisk; do
-            if [ "${{ matrix.channel }}" = nightly ]; then
-              t=nightly
-            else
-              t=$(gh release list --repo "$repo" --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
-            fi
-            [ -n "$t" ] || continue
-            if gh release download "$t" --repo "$repo" --pattern 'NetProxy_*.zip' --dir official 2>/dev/null; then
-              tag="$t"
-              # 顺便取官方 release 的更新日志，发布时附上
-              # 优先取 NetProxy-Magisk 的说明（更新日志写在那边），取不到再用下载包的仓库
-              for r in Fanju6/NetProxy-Magisk "$repo"; do
-                gh release view "$t" --repo "$r" --json body -q .body > official_notes.md 2>/dev/null || true
-                gh release view "$t" --repo "$r" --json name -q .name > official_title.txt 2>/dev/null || true
-                [ -s official_notes.md ] && break
-              done
-              break
-            fi
-          done
-          [ -n "$tag" ] || { echo "没找到官方 zip"; exit 1; }
+          # 只从原仓库取：https://github.com/Fanju6/NetProxy-Magisk/releases
+          repo=Fanju6/NetProxy-Magisk
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$(printf '%s' "$INPUT_TAG" | tr -d '[:space:]')"
+            case "$tag" in [0-9]*) tag="v$tag" ;; esac
+            printf '%s' "$tag" | grep -Eq '^v[0-9A-Za-z._+-]+$' \
+              || { echo "版本号格式不对: $tag（应为 v8.6.2 这样的写法）"; exit 1; }
+            echo "手动指定版本: $tag"
+          elif [ "${{ matrix.channel }}" = nightly ]; then
+            tag=nightly
+          else
+            tag=$(gh release list --repo "$repo" --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
+          fi
+          [ -n "$tag" ] || { echo "原仓库没有找到 ${{ matrix.channel }} 的 release"; exit 1; }
+          echo "官方版本: $tag"
+          # 安装包形如 NetProxy_v8.6.2_1090.zip
+          gh release download "$tag" --repo "$repo" --pattern 'NetProxy_*.zip' --dir official \
+            || { echo "原仓库 $tag 里没有 NetProxy_*.zip"; exit 1; }
+          ls -la official
+          # 顺便取官方 release 的标题和更新日志，发布时附上
+          gh release view "$tag" --repo "$repo" --json body -q .body > official_notes.md || true
+          gh release view "$tag" --repo "$repo" --json name -q .name > official_title.txt || true
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: 从官方包里读出源码提交号
@@ -260,6 +268,11 @@ jobs:
           ])
           print("统计代码已删除")
           PY
+          if [ ! -d internal/telemetry ]; then
+            echo "::notice::这个版本的源码里没有统计代码，无需删除"
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # 先留一份原始源码，整体删除编译不过时可以退回
           cp -r . "$RUNNER_TEMP/netproxy.orig"
           if python3 -I "$RUNNER_TEMP/strip_telemetry.py" .; then
@@ -315,11 +328,12 @@ jobs:
           if grep -rnIE "phc_[A-Za-z0-9]{20,}" ../../.. | grep -v _test.go; then
             echo "源码里有写死的 key，需要改用方案 B"; exit 1
           fi
-          if [ "$mode" = full ] && ! build; then
-            echo "::warning::整体删除后编译失败，改用空实现"
-            mode=stub; use_stub
+          if [ "$mode" = full ]; then
+            build || { echo "::warning::整体删除后编译失败，改用空实现"; mode=stub; use_stub; }
           elif [ "$mode" = stub ]; then
             use_stub
+          else
+            build
           fi
           echo "统计代码处理方式: $mode"
           BIN="$RUNNER_TEMP/netproxyctl"
@@ -399,6 +413,8 @@ jobs:
 
           EXTRA=""
           [ "${{ matrix.channel }}" = nightly ] && EXTRA="--prerelease"
+          # 手动指定的版本可能比最新版旧，不能把它标成 Latest
+          [ -n "${{ inputs.tag }}" ] && EXTRA="$EXTRA --latest=false"
           gh release create "$REL" "$OUT" --repo "$GITHUB_REPOSITORY" $EXTRA \
             --title "${TITLE}（去统计）" \
             --notes-file notes.md
