@@ -5,11 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: 重新构建已处理过的版本（会先删除同名 release）
+        description: 重新构建已处理过的版本
         type: boolean
         default: false
       tag:
-        description: 指定要构建的原仓库版本号，例如 v8.6.2（留空=自动构建最新正式版和每夜版）
+        description: 指定要构建的版本号
         type: string
         default: ""
 permissions:
@@ -56,6 +56,7 @@ jobs:
           # 顺便取官方 release 的标题和更新日志，发布时附上
           gh release view "$tag" --repo "$repo" --json body -q .body > official_notes.md || true
           gh release view "$tag" --repo "$repo" --json name -q .name > official_title.txt || true
+          gh release view "$tag" --repo "$repo" --json publishedAt -q .publishedAt > official_date.txt || true
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: 从官方包里读出源码提交号
@@ -410,6 +411,26 @@ jobs:
           # 标题沿用官方 release 的标题，后面加（去统计）；官方没写标题就用 tag
           TITLE="$(cat official_title.txt 2>/dev/null || true)"
           [ -n "$TITLE" ] || TITLE="${{ steps.up.outputs.tag }}"
+
+          # 列表顺序：GitHub 按 tag 所指提交的日期排序。直接建 tag 会指向本仓库最新提交，
+          # 谁最后构建谁排最前，旧版本会插到新版本上面。这里改成：造一个提交，日期取
+          # 官方 release 的发布时间（每夜版取当前时间，始终排在最前），再让 tag 指向它
+          DATE="$(cat official_date.txt 2>/dev/null || true)"
+          if [ "${{ matrix.channel }}" = nightly ] || [ -z "$DATE" ]; then
+            DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          BRANCH="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          BASE="$(gh api "repos/$GITHUB_REPOSITORY/commits/$BRANCH" --jq .sha)"
+          TREE="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$BASE" --jq .tree.sha)"
+          WHO="github-actions[bot]"; MAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          COMMIT="$(gh api "repos/$GITHUB_REPOSITORY/git/commits" \
+            -f message="NetProxy ${REL}" -f tree="$TREE" -f "parents[]=$BASE" \
+            -f "author[name]=$WHO" -f "author[email]=$MAIL" -f "author[date]=$DATE" \
+            -f "committer[name]=$WHO" -f "committer[email]=$MAIL" -f "committer[date]=$DATE" \
+            --jq .sha)"
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$REL" >/dev/null 2>&1 || true
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$REL" -f sha="$COMMIT" >/dev/null
+          echo "tag $REL -> $COMMIT（日期 $DATE）"
 
           EXTRA=""
           [ "${{ matrix.channel }}" = nightly ] && EXTRA="--prerelease"
